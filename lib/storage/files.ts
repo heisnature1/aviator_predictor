@@ -164,7 +164,7 @@ export async function storeReceipt(
     const { error } = await getSupabaseClient()
       .storage.from(SUPABASE_UPLOADS_BUCKET)
       .upload(relativePath, new Uint8Array(buffer), {
-        cacheControl: '3600',
+        cacheControl: '0',
         contentType: detected.mime,
         upsert: false,
       });
