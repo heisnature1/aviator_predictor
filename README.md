@@ -535,34 +535,96 @@ Feed states were verified with three server configurations:
 The app is a standard Next.js 15 application and builds cleanly
 (`npm run build`). Before handling real money:
 
+### Persistent-disk deployment with Docker
+
+The built-in JSON driver is intended for **one Node.js instance with a
+persistent writable disk**. This repository includes a `Dockerfile` and
+`.dockerignore` for that setup. The host must retain both mounted directories
+across container restarts and redeploys; do not scale this service to multiple
+instances while using local JSON storage.
+
+Build the image and prepare persistent host directories:
+
+```bash
+docker build -t aviator-predictor:latest .
+sudo install -d -m 700 /srv/aviator-predictor/data /srv/aviator-predictor/storage
+```
+
+Generate an auth secret with `openssl rand -hex 48`, then create a secrets
+file **outside the repository** at `/srv/aviator-predictor/app.env`. Paste the
+generated value into `AUTH_SECRET` and set a strong, unique admin password:
+
+```bash
+openssl rand -hex 48
+```
+
+```dotenv
+AUTH_SECRET=
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=
+ADMIN_FULL_NAME=Platform Administrator
+ADMIN_USERNAME=admin
+```
+
+Restrict access to it, then start the container with both persistent mounts:
+
+```bash
+sudo chmod 600 /srv/aviator-predictor/app.env
+docker run -d --name aviator-predictor --restart unless-stopped \
+  --env-file /srv/aviator-predictor/app.env \
+  -e STORAGE_MODE=local \
+  -e DATA_DIR=/app/data \
+  -e STORAGE_DIR=/app/storage \
+  -p 3000:3000 \
+  -v /srv/aviator-predictor/data:/app/data \
+  -v /srv/aviator-predictor/storage:/app/storage \
+  aviator-predictor:latest
+```
+
+Put the service behind an HTTPS reverse proxy. Keep exactly one application
+instance when using the local driver; it coordinates writes only inside that
+process. The data and receipt folders must be backed up as sensitive data.
+
+Vercel and other serverless hosts do **not** provide this persistent writable
+filesystem. A Vercel deployment needs a persistent storage driver integrated
+with the app; pointing `DATA_DIR` or `STORAGE_DIR` at `/tmp` is not a safe
+solution for accounts, payments, receipts or wallet balances.
+
+Before handling real money:
+
 1. Set a strong `AUTH_SECRET` and configure the `ADMIN_*` variables.
 2. Point `AVIATOR_PROVIDER_URL` at a data source you are licensed to use.
-3. **Register a persistent storage driver** (see
-   [Data & storage architecture](#data--storage-architecture)) and set
-   `STORAGE_MODE` to it. The default local driver is correct for development
-   and single-node self-hosting, not for serverless platforms with ephemeral
-   disks — the admin dashboard warns you when that combination is detected.
+3. Ensure storage is durable: use a registered persistent driver on serverless
+   or multi-instance hosts, or use the local driver with persistent mounted
+   disks on a single-node host.
 4. Keep `AVIATOR_ALLOW_SIMULATION` and `AVIATOR_PREDICTIONS_ALLOW_SIMULATED`
    set to `false`.
 5. Serve over HTTPS (session cookies are marked `Secure` in production).
 
 ### Troubleshooting
 
-**Every page shows "Unexpected error", or nobody can sign in (503).**
-This almost always means `AUTH_SECRET` is missing, too short, or still the
-`.env.example` placeholder in a production process. The server logs a
-`CONFIGURATION ERROR` banner on boot when that happens. Until it is fixed the
-app degrades safely — visitors are treated as signed out and account actions
-return a clear `503` instead of crashing — but nobody can authenticate. Set a
-strong `AUTH_SECRET` and restart:
+**The page shows "Unexpected error" after a successful build.**
+That is the root error boundary; its `Reference` number is a Next.js digest,
+not the original exception. Check the runtime/function logs for the request. A
+common cause on Vercel is `STORAGE_MODE=local` (the default): startup creates
+and writes JSON files beneath `process.cwd()`, but a serverless deployment does
+not provide a persistent writable app directory. This repository currently
+ships only the local driver, so setting `STORAGE_MODE` to an unregistered name
+will also fail at runtime. Use the Docker + persistent-disk setup above, or
+integrate and configure a real persistent driver before using Vercel. Do not
+use `/tmp` for account, payment, receipt or wallet data.
+
+A missing or placeholder `AUTH_SECRET` is a separate issue: the server logs a
+`CONFIGURATION ERROR`, treats visitors as signed out and returns `503` for
+account actions; it should not by itself crash the root layout. Generate a
+strong secret and set it in the production environment:
 
 ```bash
 node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
-# export the result as AUTH_SECRET, then restart the server
 ```
 
-Note that changing `AUTH_SECRET` invalidates all existing sessions and CSRF
-tokens by design (they are keyed to the secret), so users simply sign in again.
+Changing `AUTH_SECRET` invalidates existing sessions and CSRF tokens by design,
+so users simply sign in again.
 
 ---
 
