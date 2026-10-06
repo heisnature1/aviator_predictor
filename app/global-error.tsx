@@ -32,8 +32,10 @@ export default function RootError({
             happening.
           </p>
           <p className="mt-3 text-xs leading-relaxed text-slate-500">
-            If this is on Vercel, check that Neon is connected (<code>DATABASE_URL</code> is
-            available) and <code>STORAGE_MODE=postgres</code>; local file storage is not writable there.
+            If this is on Vercel, check that Supabase is configured: <code>DATABASE_URL</code>,
+            <code>SUPABASE_URL</code>, and the server-only <code>SUPABASE_SERVICE_ROLE_KEY</code>
+            must be available, with <code>STORAGE_MODE=postgres</code>. Local file storage is not
+            durable there.
           </p>
           {error.digest ? (
             <p className="mt-3 text-xs text-slate-600">

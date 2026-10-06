@@ -40,7 +40,7 @@ export function getDriver(): StorageDriver {
     const mode = configuredMode || (process.env.VERCEL === '1' ? 'postgres' : 'local');
     if (process.env.VERCEL === '1' && process.env.NODE_ENV === 'production' && mode === 'local') {
       throw new StorageConfigurationError(
-        'Vercel does not provide a persistent writable filesystem. Set STORAGE_MODE=postgres and connect a Neon database with DATABASE_URL before deploying.',
+        'Vercel does not provide a persistent writable filesystem. Set STORAGE_MODE=postgres and connect Supabase Postgres with SUPABASE_DB_URL, DATABASE_URL, or POSTGRES_URL before deploying.',
       );
     }
     cachedDriver = resolveDriver(mode);
@@ -67,7 +67,7 @@ export function describeStorage() {
     warning:
       driver.persistent || process.env.NODE_ENV !== 'production'
         ? null
-        : 'Local JSON storage is not durable on serverless platforms. Use STORAGE_MODE=postgres with DATABASE_URL on Vercel.',
+        : 'Local JSON storage is not durable on serverless platforms. Use STORAGE_MODE=postgres with a Supabase Postgres connection URL on Vercel.',
   };
 }
 
@@ -148,8 +148,7 @@ export function ensureStore(): Promise<void> {
       const driver = getDriver();
       await driver.ensureReady();
       await driver.ensureDir(path.join('storage', 'receipts')).catch(() => undefined);
-      // The local driver stores receipts on disk. Remote drivers (such as
-      // Neon/Postgres) keep them in their persistent document store instead.
+      // The local driver stores receipts on disk. Remote drivers keep receipt bytes in private persistent storage instead.
       if (driver.mode === 'local') {
         const { mkdir } = await import('node:fs/promises');
         await mkdir(RECEIPTS_ROOT, { recursive: true });

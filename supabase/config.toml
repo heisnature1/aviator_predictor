@@ -1,0 +1,15 @@
+project_id = "aviator-predictor"
+
+[api]
+enabled = true
+
+[storage]
+enabled = true
+
+[storage.buckets.uploads]
+public = false
+file_size_limit = "5MiB"
+allowed_mime_types = ["image/jpeg", "image/png", "image/webp", "application/pdf"]
+
+[functions.api]
+verify_jwt = false

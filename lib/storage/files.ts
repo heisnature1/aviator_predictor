@@ -2,13 +2,15 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { getDriver, RECEIPTS_ROOT } from './database';
+import { StorageWriteError } from './drivers';
+import { getSupabaseClient, SUPABASE_UPLOADS_BUCKET } from './supabase-client';
 
 /**
  * Receipt file storage.
  * ---------------------------------------------------------------------------
- * Uploaded receipts are written to `storage/receipts/<user-id>/<id>.<ext>`.
- * The directory is NEVER publicly exposed: files are only ever served through
- * /api/receipts/[id], which authorises the request first (owner or admin).
+ * Local receipts are written to `storage/receipts/<user-id>/<id>.<ext>`;
+ * remote receipts live in the private Supabase `uploads` bucket. Files are only
+ * served through /api/receipts/[id], which authorises the request first.
  */
 
 export const RECEIPT_MIME_TYPES = {
@@ -59,6 +61,28 @@ const SIGNATURES: MagicSignature[] = [
   },
   { mime: 'application/pdf', test: (b) => b.toString('ascii', 0, 4) === '%PDF' },
 ];
+
+function isMissingStorageObject(error: { status?: number; statusCode?: string; message: string }) {
+  return (
+    error.status === 404 ||
+    error.statusCode === '404' ||
+    error.statusCode === 'NoSuchKey' ||
+    /object.*not found|not found.*object/i.test(error.message)
+  );
+}
+
+async function readSupabaseReceipt(key: string): Promise<Buffer | null> {
+  const { data, error } = await getSupabaseClient()
+    .storage.from(SUPABASE_UPLOADS_BUCKET)
+    .download(key);
+  if (error) {
+    if (isMissingStorageObject(error)) return null;
+    console.error('[storage] Supabase receipt download failed', error);
+    throw new StorageWriteError('Unable to read the receipt from private storage.');
+  }
+  if (!data) return null;
+  return Buffer.from(await data.arrayBuffer());
+}
 
 export interface StoredReceipt {
   /** Path relative to the storage root, e.g. `receipts/<user>/<id>.png`. */
@@ -137,9 +161,17 @@ export async function storeReceipt(
   const driver = getDriver();
 
   if (driver.mode !== 'local') {
-    // Remote document drivers persist the receipt alongside collection data.
-    // The value is base64 text; it is never exposed as a public URL.
-    await driver.write(relativePath, buffer.toString('base64'));
+    const { error } = await getSupabaseClient()
+      .storage.from(SUPABASE_UPLOADS_BUCKET)
+      .upload(relativePath, new Uint8Array(buffer), {
+        cacheControl: '3600',
+        contentType: detected.mime,
+        upsert: false,
+      });
+    if (error) {
+      console.error('[storage] Supabase receipt upload failed', error);
+      throw new StorageWriteError('Unable to store the receipt in private storage.');
+    }
     return { relativePath, fileName, mime: detected.mime, size: buffer.byteLength };
   }
 
@@ -190,8 +222,8 @@ export async function readReceipt(relativePath: string): Promise<ReadReceiptResu
     const buffer =
       driver.mode === 'local'
         ? await fs.readFile(path.join(path.dirname(RECEIPTS_ROOT), ...segments))
-        : Buffer.from((await driver.read(key)) ?? '', 'base64');
-    if (buffer.byteLength === 0) return null;
+        : await readSupabaseReceipt(key);
+    if (!buffer || buffer.byteLength === 0) return null;
     const mime =
       extension === 'pdf'
         ? 'application/pdf'
@@ -219,7 +251,13 @@ export async function deleteReceipt(relativePath: string): Promise<void> {
 
   const driver = getDriver();
   if (driver.mode !== 'local') {
-    await driver.remove(key);
+    const { error } = await getSupabaseClient()
+      .storage.from(SUPABASE_UPLOADS_BUCKET)
+      .remove([key]);
+    if (error && !isMissingStorageObject(error)) {
+      console.error('[storage] Supabase receipt deletion failed', error);
+      throw new StorageWriteError('Unable to delete the receipt from private storage.');
+    }
     return;
   }
 

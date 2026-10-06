@@ -1,24 +1,28 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { Pool, type PoolClient } from '@neondatabase/serverless';
+import { Pool, type PoolClient } from 'pg';
+import { getSupabaseClient } from './supabase-client';
 import { StorageConfigurationError, StorageWriteError, type StorageDriver } from './drivers';
 
-const TABLE_NAME = 'aviator_storage_documents';
+const TABLE_NAME = 'public.aviator_storage_documents';
 const transactionClient = new AsyncLocalStorage<PoolClient>();
 const ADVISORY_LOCK_SQL = 'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))';
 
-interface NeonGlobals {
-  __aviatorNeonPool?: Pool;
-  __aviatorNeonUrl?: string;
+interface SupabaseGlobals {
+  __aviatorSupabasePool?: Pool;
+  __aviatorSupabaseDatabaseUrl?: string;
 }
 
-const neonGlobals = globalThis as typeof globalThis & NeonGlobals;
+const supabaseGlobals = globalThis as typeof globalThis & SupabaseGlobals;
 let tableReady: Promise<void> | null = null;
 
 function connectionString(): string {
-  const value = process.env.DATABASE_URL?.trim() || process.env.POSTGRES_URL?.trim();
+  const value =
+    process.env.SUPABASE_DB_URL?.trim() ||
+    process.env.DATABASE_URL?.trim() ||
+    process.env.POSTGRES_URL?.trim();
   if (!value) {
     throw new StorageConfigurationError(
-      'STORAGE_MODE="postgres" requires DATABASE_URL (or POSTGRES_URL). Connect a Neon Postgres database to this Vercel project, then redeploy.',
+      'STORAGE_MODE="postgres" requires a Supabase transaction-pooler URL in SUPABASE_DB_URL, DATABASE_URL, or POSTGRES_URL. Set it in Vercel, then redeploy.',
     );
   }
   return value;
@@ -26,17 +30,18 @@ function connectionString(): string {
 
 function getPool(): Pool {
   const url = connectionString();
-  if (!neonGlobals.__aviatorNeonPool || neonGlobals.__aviatorNeonUrl !== url) {
-    neonGlobals.__aviatorNeonPool = new Pool({
+  if (!supabaseGlobals.__aviatorSupabasePool || supabaseGlobals.__aviatorSupabaseDatabaseUrl !== url) {
+    supabaseGlobals.__aviatorSupabasePool = new Pool({
       connectionString: url,
+      ssl: { rejectUnauthorized: true },
       max: 1,
       idleTimeoutMillis: 10_000,
       maxLifetimeSeconds: 300,
       allowExitOnIdle: true,
     });
-    neonGlobals.__aviatorNeonUrl = url;
+    supabaseGlobals.__aviatorSupabaseDatabaseUrl = url;
   }
-  return neonGlobals.__aviatorNeonPool;
+  return supabaseGlobals.__aviatorSupabasePool;
 }
 
 function normaliseKey(relativePath: string): string {
@@ -76,6 +81,8 @@ async function ensureTable(): Promise<void> {
           updated_at timestamptz NOT NULL DEFAULT now()
         )
       `);
+      await client.query(`ALTER TABLE ${TABLE_NAME} ENABLE ROW LEVEL SECURITY`);
+      await client.query(`REVOKE ALL ON TABLE ${TABLE_NAME} FROM PUBLIC, anon, authenticated`);
     }).catch((error) => {
       tableReady = null;
       throw error;
@@ -116,17 +123,18 @@ async function runTransaction<T>(task: () => Promise<T>, lockKey?: string): Prom
 }
 
 /**
- * Neon/Postgres-backed storage for Vercel and other serverless Node runtimes.
- * Collection documents and private receipt contents share one table; receipts
- * are base64-encoded by files.ts and are only read after route authorization.
+ * Supabase/Postgres-backed storage for Vercel and other serverless Node runtimes.
+ * Collection documents share one private table. Receipt blobs live in the
+ * private Supabase Storage uploads bucket and are read after route authorization.
  */
 export function createPostgresDriver(): StorageDriver {
   return {
     mode: 'postgres',
-    label: 'Neon Postgres (serverless)',
+    label: 'Supabase Postgres (serverless)',
     persistent: true,
 
     async ensureReady() {
+      getSupabaseClient();
       await ensureTable();
     },
 

@@ -10,9 +10,10 @@ import path from 'node:path';
  * correct for development and single-node self hosting.
  *
  * `local` (JSON files) is intended for development or one server with a
- * persistent disk. `postgres` stores documents and private receipts in Neon
- * Postgres for Vercel/serverless deployments. Additional drivers can be
- * registered with `registerDriver()` without changing business logic.
+ * persistent disk. `postgres` stores documents in Supabase Postgres and
+ * receipts in its private Storage bucket for Vercel/serverless deployments.
+ * Additional drivers can be registered with `registerDriver()` without
+ * changing business logic.
  *
  * IMPORTANT: a serverless platform does NOT give you a permanent writable disk.
  * If `STORAGE_MODE` is set to anything that has no registered driver, the app
@@ -181,7 +182,7 @@ export function resolveDriver(mode: string | undefined): StorageDriver {
     throw new StorageConfigurationError(
       `STORAGE_MODE="${resolvedMode}" has no registered storage driver. ` +
         `Set STORAGE_MODE=local for the built-in JSON backend, or set ` +
-        `STORAGE_MODE=postgres and DATABASE_URL for the Neon serverless backend. ` +
+        `STORAGE_MODE=postgres and a Supabase Postgres connection URL. ` +
         `The application refuses to start rather than silently lose accounts, ` +
         `payments and wallet balances.`,
     );
