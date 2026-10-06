@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { RECEIPTS_ROOT } from './database';
+import { getDriver, RECEIPTS_ROOT } from './database';
 
 /**
  * Receipt file storage.
@@ -132,10 +132,21 @@ export async function storeReceipt(
 
   const extension = RECEIPT_MIME_TYPES[detected.mime];
   const id = `${Date.now().toString(36)}-${randomBytes(6).toString('hex')}`;
+  const fileName = `${id}.${extension}`;
+  const relativePath = `receipts/${safeUserDir}/${fileName}`;
+  const driver = getDriver();
+
+  if (driver.mode !== 'local') {
+    // Remote document drivers persist the receipt alongside collection data.
+    // The value is base64 text; it is never exposed as a public URL.
+    await driver.write(relativePath, buffer.toString('base64'));
+    return { relativePath, fileName, mime: detected.mime, size: buffer.byteLength };
+  }
+
   const targetDir = path.join(RECEIPTS_ROOT, safeUserDir);
   await fs.mkdir(targetDir, { recursive: true });
 
-  const absolute = path.join(targetDir, `${id}.${extension}`);
+  const absolute = path.join(targetDir, fileName);
   const tmp = path.join(targetDir, `.${id}.${extension}.${randomBytes(4).toString('hex')}.tmp`);
   const handle = await fs.open(tmp, 'w');
   try {
@@ -148,7 +159,7 @@ export async function storeReceipt(
 
   return {
     relativePath: path.relative(path.dirname(RECEIPTS_ROOT), absolute).split(path.sep).join('/'),
-    fileName: `${id}.${extension}`,
+    fileName,
     mime: detected.mime,
     size: buffer.byteLength,
   };
@@ -162,16 +173,25 @@ export interface ReadReceiptResult {
 
 /** Reads a receipt by its stored relative path (e.g. `receipts/<user>/<file>`). */
 export async function readReceipt(relativePath: string): Promise<ReadReceiptResult | null> {
-  if (!relativePath || relativePath.includes('..')) return null;
-  const absolute = path.join(path.dirname(RECEIPTS_ROOT), relativePath);
-  const root = path.dirname(RECEIPTS_ROOT) + path.sep;
-  if (!absolute.startsWith(root)) return null;
+  const key = relativePath.replace(/\\/g, '/');
+  const segments = key.split('/');
+  if (
+    !key.startsWith('receipts/') ||
+    segments.some((segment) => !segment || segment === '.' || segment === '..')
+  ) {
+    return null;
+  }
 
-  const extension = path.extname(absolute).slice(1).toLowerCase();
+  const extension = path.posix.extname(key).slice(1).toLowerCase();
   if (!RECEIPT_EXTENSIONS.includes(extension as (typeof RECEIPT_EXTENSIONS)[number])) return null;
 
+  const driver = getDriver();
   try {
-    const buffer = await fs.readFile(absolute);
+    const buffer =
+      driver.mode === 'local'
+        ? await fs.readFile(path.join(path.dirname(RECEIPTS_ROOT), ...segments))
+        : Buffer.from((await driver.read(key)) ?? '', 'base64');
+    if (buffer.byteLength === 0) return null;
     const mime =
       extension === 'pdf'
         ? 'application/pdf'
@@ -180,7 +200,7 @@ export async function readReceipt(relativePath: string): Promise<ReadReceiptResu
           : extension === 'webp'
             ? 'image/webp'
             : 'image/jpeg';
-    return { buffer, mime, fileName: path.basename(absolute) };
+    return { buffer, mime, fileName: path.posix.basename(key) };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
@@ -188,12 +208,23 @@ export async function readReceipt(relativePath: string): Promise<ReadReceiptResu
 }
 
 export async function deleteReceipt(relativePath: string): Promise<void> {
-  if (!relativePath || relativePath.includes('..')) return;
-  const absolute = path.join(path.dirname(RECEIPTS_ROOT), relativePath);
-  const root = path.dirname(RECEIPTS_ROOT) + path.sep;
-  if (!absolute.startsWith(root)) return;
+  const key = relativePath.replace(/\\/g, '/');
+  const segments = key.split('/');
+  if (
+    !key.startsWith('receipts/') ||
+    segments.some((segment) => !segment || segment === '.' || segment === '..')
+  ) {
+    return;
+  }
+
+  const driver = getDriver();
+  if (driver.mode !== 'local') {
+    await driver.remove(key);
+    return;
+  }
+
   try {
-    await fs.unlink(absolute);
+    await fs.unlink(path.join(path.dirname(RECEIPTS_ROOT), ...segments));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }

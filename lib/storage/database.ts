@@ -10,6 +10,7 @@ import {
   type StorageDriver,
 } from './drivers';
 import { DEFAULT_PACKAGES, DEFAULT_PAYMENT_SETTINGS, DEFAULT_SYSTEM_SETTINGS } from './defaults';
+import { createPostgresDriver } from './postgres-driver';
 
 /**
  * JSON collection store.
@@ -29,14 +30,28 @@ export const STORAGE_ROOT = path.resolve(process.cwd(), process.env.STORAGE_DIR 
 export const RECEIPTS_ROOT = path.join(STORAGE_ROOT, 'receipts');
 
 registerDriver(createLocalDriver({ root: DATA_ROOT }));
+registerDriver(createPostgresDriver());
 
 let cachedDriver: StorageDriver | null = null;
 
 export function getDriver(): StorageDriver {
   if (!cachedDriver) {
-    cachedDriver = resolveDriver(process.env.STORAGE_MODE);
+    const configuredMode = process.env.STORAGE_MODE?.trim();
+    const mode = configuredMode || (process.env.VERCEL === '1' ? 'postgres' : 'local');
+    if (process.env.VERCEL === '1' && process.env.NODE_ENV === 'production' && mode === 'local') {
+      throw new StorageConfigurationError(
+        'Vercel does not provide a persistent writable filesystem. Set STORAGE_MODE=postgres and connect a Neon database with DATABASE_URL before deploying.',
+      );
+    }
+    cachedDriver = resolveDriver(mode);
   }
   return cachedDriver;
+}
+
+/** Runs a group of storage operations atomically when the active driver supports it. */
+export function withStorageTransaction<T>(task: () => Promise<T>, lockKey?: string): Promise<T> {
+  const driver = getDriver();
+  return driver.transaction ? driver.transaction(task, lockKey) : task();
 }
 
 /** Test/back-office helper: reports which backend is actually in use. */
@@ -46,13 +61,13 @@ export function describeStorage() {
     mode: driver.mode,
     label: driver.label,
     persistent: driver.persistent,
-    data_root: DATA_ROOT,
-    receipts_root: RECEIPTS_ROOT,
+    data_root: driver.mode === 'local' ? DATA_ROOT : null,
+    receipts_root: driver.mode === 'local' ? RECEIPTS_ROOT : null,
     is_production: process.env.NODE_ENV === 'production',
     warning:
       driver.persistent || process.env.NODE_ENV !== 'production'
         ? null
-        : 'Local JSON storage is not durable on serverless platforms. Register a persistent storage driver before handling real funds.',
+        : 'Local JSON storage is not durable on serverless platforms. Use STORAGE_MODE=postgres with DATABASE_URL on Vercel.',
   };
 }
 
@@ -133,15 +148,23 @@ export function ensureStore(): Promise<void> {
       const driver = getDriver();
       await driver.ensureReady();
       await driver.ensureDir(path.join('storage', 'receipts')).catch(() => undefined);
-      // Receipts live outside the data root, so make sure the folder exists.
-      const { mkdir } = await import('node:fs/promises');
-      await mkdir(RECEIPTS_ROOT, { recursive: true });
+      // The local driver stores receipts on disk. Remote drivers (such as
+      // Neon/Postgres) keep them in their persistent document store instead.
+      if (driver.mode === 'local') {
+        const { mkdir } = await import('node:fs/promises');
+        await mkdir(RECEIPTS_ROOT, { recursive: true });
+      }
 
       for (const definition of Object.values(DEFINITIONS)) {
         await driver.ensureDir(path.dirname(definition.file));
-        const existing = await driver.read(definition.file);
-        if (existing === null) {
-          await driver.write(definition.file, `${JSON.stringify(definition.seed(), null, 2)}\n`);
+        const seed = `${JSON.stringify(definition.seed(), null, 2)}\n`;
+        if (driver.update) {
+          // Seed under the driver's cross-instance lock so concurrent Vercel
+          // cold starts cannot overwrite a collection another request created.
+          await driver.update(definition.file, (existing) => existing ?? seed);
+        } else {
+          const existing = await driver.read(definition.file);
+          if (existing === null) await driver.write(definition.file, seed);
         }
       }
     })().catch((error) => {
@@ -226,6 +249,48 @@ export async function mutateCollection<T>(
   name: CollectionName,
   mutator: (current: T) => T | Promise<T>,
 ): Promise<T> {
+  const driver = getDriver();
+  if (driver.update) {
+    await ensureStore();
+    const definition = DEFINITIONS[name];
+    const schema = collectionSchemas[name] as z.ZodTypeAny;
+    let nextValue: T | undefined;
+    let corruptRaw: string | null = null;
+
+    await driver.update(definition.file, async (raw) => {
+      let current: T;
+      if (raw === null || raw.trim() === '') {
+        current = definition.seed() as T;
+      } else {
+        try {
+          current = parseCollection<T>(name, raw);
+        } catch (error) {
+          corruptRaw = raw;
+          console.error(`[storage] resetting corrupt collection "${name}": ${(error as Error).message}`);
+          current = definition.seed() as T;
+        }
+      }
+
+      const next = await mutator(current);
+      const result = schema.safeParse(next);
+      if (!result.success) {
+        throw new StorageWriteError(
+          `Refusing to write invalid data to "${name}": ${result.error.issues[0]?.message ?? 'validation failed'}`,
+        );
+      }
+      nextValue = result.data as T;
+      return `${JSON.stringify(result.data, null, 2)}\n`;
+    });
+
+    if (corruptRaw !== null) {
+      await quarantine(name, corruptRaw, 'schema or JSON validation failed');
+    }
+    if (nextValue === undefined) {
+      throw new StorageWriteError(`The atomic update of "${name}" did not produce a value`);
+    }
+    return nextValue;
+  }
+
   return serialise(name, async () => {
     const current = await readCollection<T>(name);
     const next = await mutator(current);

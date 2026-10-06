@@ -2,8 +2,8 @@
 
 A production-structured Aviator insights platform: real user accounts, secure
 cookie sessions, wallet & credits, receipt-based payment verification, a
-statistical prediction service and a full administrator dashboard — built on a
-file-based backend with **no external database**.
+statistical prediction service and a full administrator dashboard. It uses
+local JSON files for self-hosting and an optional Neon Postgres backend on Vercel.
 
 > **Integrity first.** This project never fabricates official Aviator results,
 > never presents simulated numbers as real game data, and never claims that a
@@ -47,8 +47,9 @@ npm run seed:demo               # optional: demo users, payments & history
 npm run dev                     # http://localhost:3000
 ```
 
-`data/` and `storage/` are created automatically on first boot if they are
-missing — no manual setup, no database, no Supabase.
+In the default local mode, `data/` and `storage/` are created automatically
+on first boot if missing. On Vercel, connect Neon and select the `postgres`
+storage mode instead of relying on local files.
 
 Other commands:
 
@@ -130,13 +131,13 @@ overview and an immutable activity log.
 | Language   | TypeScript (strict)                                     |
 | Styling    | Tailwind CSS 3.4 (dark glass/gaming aesthetic)           |
 | Backend    | Node.js route handlers + server components               |
-| Storage    | JSON files in `data/`, receipts in `storage/receipts/`   |
+| Storage    | Local JSON files, or Neon Postgres documents/receipts on Vercel |
 | Auth       | HTTP-only cookies + scrypt password hashing + CSRF       |
 | Validation | Zod on every API boundary                                |
 
-**Not used:** Supabase, Firebase, PostgreSQL, MongoDB, Prisma or any external
-database / storage-as-a-service. There is no Supabase client, schema, migration
-or environment variable anywhere in the repository.
+The default `local` mode has no external database dependency. The optional
+`postgres` mode uses Neon Postgres for Vercel/serverless deployments. The app
+does not use Supabase, Firebase, MongoDB or Prisma.
 
 ---
 
@@ -205,6 +206,9 @@ data/
 storage/receipts/<user-id>/<id>.<ext>
 ```
 
+The tree above shows the local driver. With `STORAGE_MODE=postgres`, these
+collections and receipt paths are records in `aviator_storage_documents`.
+
 ### Storage abstraction
 
 Nothing outside `lib/storage` touches the filesystem. Business logic uses typed
@@ -215,54 +219,45 @@ await usersCollection.mutate((users) => [...users, newUser]);
 ```
 
 `lib/storage/drivers.ts` defines the `StorageDriver` interface (read / write /
-remove / list / ensureDir). The bundled `local` driver stores JSON in `data/`.
-A persistent driver (object storage, KV, hosted database) can be registered
-without touching business logic:
-
-```ts
-registerDriver(myPersistentDriver); // then set STORAGE_MODE=<its mode>
-```
+remove / list / ensureDir, with optional atomic update/transaction support). The
+bundled `local` driver stores JSON in `data/`.
+The bundled `postgres` driver stores collection documents and private receipt
+files in a Neon Postgres table, so it works across Vercel serverless instances.
+Additional drivers can still be registered without changing business logic.
 
 ### Write safety
 
-Every write follows the same protocol:
-
-1. read the current file
-2. validate it against a Zod schema
-3. write the payload to a unique temp file in the same directory
-4. `fsync` the temp file
-5. atomically `rename()` it over the target
-
-Consequences: a crash or an interrupted write can never leave a half-written
-JSON file; readers always see the previous or the new complete document.
+The local driver writes a temporary file, `fsync`s it, then atomically renames
+it over the target. The Postgres driver validates collection JSON and performs
+writes in Neon with per-document advisory locks; it never writes into Vercel's
+read-only deployment directory.
 
 Additional protections:
 
-- **Per-collection serialisation** — concurrent read-modify-write cycles are
-  queued, so two requests cannot lose each other's changes.
-- **Ledger atomicity** — wallet balance + transaction row are written inside one
-  exclusive lock (`lib/storage/lock.ts`).
-- **Corruption recovery** — an unparseable/invalid file is quarantined to
-  `data/_corrupt/<name>-<timestamp>.json` and rebuilt from its seed value
-  instead of crashing the app.
-- **Path traversal guard** — the local driver refuses any path outside the data
-  directory.
+- **Per-collection serialisation** — concurrent read-modify-write cycles use a
+  process lock locally and a Postgres advisory transaction lock on Vercel.
+- **Ledger atomicity** — wallet balance + transaction row are written in one
+  storage transaction on Postgres (and one exclusive lock on a single local
+  process).
+- **Corruption recovery** — invalid JSON is logged and reset to the collection
+  seed; local files are quarantined under `data/_corrupt/`.
+- **Path traversal guard** — local paths are confined to their data directory;
+  remote document keys reject absolute paths and `..` segments.
 
 ### `STORAGE_MODE` and deployments
 
-`STORAGE_MODE=local` uses the JSON backend. **Local disks on serverless
-platforms are not durable** — the app does not pretend otherwise:
+- `STORAGE_MODE=local` uses JSON files and is intended for development or one
+  self-hosted Node.js instance with a persistent mounted disk.
+- `STORAGE_MODE=postgres` uses the built-in Neon driver for serverless and
+  multi-instance deployments. Set `DATABASE_URL` to the pooled Neon connection
+  string. Vercel defaults to `postgres` when `STORAGE_MODE` is omitted; setting
+  `local` on Vercel production fails fast with a configuration error.
+- An unregistered mode fails with `StorageConfigurationError` rather than
+  silently accepting writes that would be lost.
 
-- `/admin` and `/admin/settings` show a durability warning when running in
-  production with a non-persistent driver.
-- If `STORAGE_MODE` names a mode with **no registered driver**, boot fails with
-  an explicit `StorageConfigurationError` instead of silently accepting writes
-  that would be lost.
-
-To go live with real money, register a persistent driver in
-`lib/storage/drivers.ts` (or swap the local driver for one backed by object
-storage / a hosted database) and set `STORAGE_MODE` accordingly. No business
-logic changes are required.
+On Vercel, the Postgres driver stores collection JSON and base64-encoded receipt
+files in the managed database. Receipt bytes are never served from a public
+storage URL; downloads still pass through the owner/admin authorization route.
 
 ---
 
@@ -457,8 +452,9 @@ Mutations require the CSRF header.
 | `AUTH_SECRET` | – | **Required in production.** Signs session/CSRF material. Must be ≥ 16 chars and not the `.env.example` placeholder. Generate: `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
 | `SESSION_TTL_HOURS` | `168` | Session lifetime |
 | `LOGIN_RATE_LIMIT` / `REGISTER_RATE_LIMIT` | `8` / `5` | Rate-limit ceilings per 15 min / hour |
-| `STORAGE_MODE` | `local` | Storage driver selector |
-| `DATA_DIR` / `STORAGE_DIR` | `data` / `storage` | Storage roots |
+| `STORAGE_MODE` | `local` (`postgres` on Vercel if omitted) | `local` JSON files or `postgres` Neon storage |
+| `DATABASE_URL` / `POSTGRES_URL` | – | Pooled Neon Postgres connection string (Vercel Neon integration provides `DATABASE_URL`) |
+| `DATA_DIR` / `STORAGE_DIR` | `data` / `storage` | Local-driver storage roots only |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_FULL_NAME` / `ADMIN_USERNAME` | – | Bootstrap administrator (quote values containing `#`) |
 | `AVIATOR_PROVIDER_URL` | – | Authorised live data endpoint |
 | `AVIATOR_PROVIDER_KEY` | – | Bearer token for the provider |
@@ -585,18 +581,36 @@ Put the service behind an HTTPS reverse proxy. Keep exactly one application
 instance when using the local driver; it coordinates writes only inside that
 process. The data and receipt folders must be backed up as sensitive data.
 
-Vercel and other serverless hosts do **not** provide this persistent writable
-filesystem. A Vercel deployment needs a persistent storage driver integrated
-with the app; pointing `DATA_DIR` or `STORAGE_DIR` at `/tmp` is not a safe
-solution for accounts, payments, receipts or wallet balances.
+### Vercel deployment with Neon Postgres
+
+Vercel does not provide a persistent writable app directory, so use the
+Postgres driver instead of the local JSON backend:
+
+1. In Vercel, add the **Neon** integration from the Marketplace and connect it
+   to this project for Production (and Preview if you use preview deployments).
+   The integration supplies a pooled `DATABASE_URL` environment variable.
+2. In **Project Settings → Environment Variables**, set `STORAGE_MODE` to
+   `postgres` for Production and Preview. Do not set it to `local`.
+3. Set the project Node.js runtime to **22.x** or newer. The Neon serverless
+   driver uses WebSockets for transactions.
+4. Set a strong `AUTH_SECRET` and strong `ADMIN_EMAIL` / `ADMIN_PASSWORD`
+   values in Vercel. Never use the example credentials.
+5. Redeploy. On first request, the app creates its `aviator_storage_documents`
+   table, seeds default settings/packages, and creates the configured admin if
+   one does not exist.
+
+For local testing with Neon, add `DATABASE_URL` to your untracked `.env.local`
+and set `STORAGE_MODE=postgres`. Back up the Neon database: it contains all
+account, session, payment, wallet, audit and private receipt data. Existing
+JSON files on a previous Vercel function instance are not durable and cannot be
+assumed to be recoverable or migrated.
 
 Before handling real money:
 
-1. Set a strong `AUTH_SECRET` and configure the `ADMIN_*` variables.
+1. Set a strong `AUTH_SECRET` and configure unique `ADMIN_*` credentials.
 2. Point `AVIATOR_PROVIDER_URL` at a data source you are licensed to use.
-3. Ensure storage is durable: use a registered persistent driver on serverless
-   or multi-instance hosts, or use the local driver with persistent mounted
-   disks on a single-node host.
+3. Use Neon/Postgres on Vercel or persistent mounted disks on one self-hosted
+   Node.js instance. Never point local JSON storage at `/tmp`.
 4. Keep `AVIATOR_ALLOW_SIMULATION` and `AVIATOR_PREDICTIONS_ALLOW_SIMULATED`
    set to `false`.
 5. Serve over HTTPS (session cookies are marked `Secure` in production).
@@ -605,14 +619,12 @@ Before handling real money:
 
 **The page shows "Unexpected error" after a successful build.**
 That is the root error boundary; its `Reference` number is a Next.js digest,
-not the original exception. Check the runtime/function logs for the request. A
-common cause on Vercel is `STORAGE_MODE=local` (the default): startup creates
-and writes JSON files beneath `process.cwd()`, but a serverless deployment does
-not provide a persistent writable app directory. This repository currently
-ships only the local driver, so setting `STORAGE_MODE` to an unregistered name
-will also fail at runtime. Use the Docker + persistent-disk setup above, or
-integrate and configure a real persistent driver before using Vercel. Do not
-use `/tmp` for account, payment, receipt or wallet data.
+not the original exception. Check the runtime/function logs for the request.
+On Vercel, confirm the Neon integration is connected, `DATABASE_URL` is
+available to the deployment, `STORAGE_MODE=postgres` (or unset so Vercel's
+Postgres default is used), and the Node.js runtime is 22.x or newer. The local
+JSON driver writes under `process.cwd()` and is not supported on Vercel; do not
+point it at `/tmp` for account, payment, receipt or wallet data.
 
 A missing or placeholder `AUTH_SECRET` is a separate issue: the server logs a
 `CONFIGURATION ERROR`, treats visitors as signed out and returns `503` for

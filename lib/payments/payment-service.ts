@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import { paymentsCollection } from '@/lib/storage/collections';
+import { withStorageTransaction } from '@/lib/storage/database';
 import { createLock } from '@/lib/storage/lock';
-import { storeReceipt, type IncomingFile } from '@/lib/storage/files';
+import { deleteReceipt, storeReceipt, type IncomingFile } from '@/lib/storage/files';
 import { Errors } from '@/lib/http';
 import { getPaymentSettings, getSystemSettings } from '@/lib/settings/settings-service';
 import { getUserById, setAccountStatus } from '@/lib/users/user-service';
@@ -104,7 +105,25 @@ export async function createActivationPayment(input: SubmitPaymentInput): Promis
     rejection_reason: null,
   };
 
-  await paymentsCollection.mutate((payments) => [...payments, payment]);
+  try {
+    await paymentsCollection.mutate((payments) => {
+      const alreadyPending = payments.some(
+        (item) =>
+          item.user_id === input.user_id &&
+          item.type === 'account_activation' &&
+          item.status === 'pending',
+      );
+      if (alreadyPending) {
+        throw Errors.conflict(
+          'You already have an activation payment waiting for review. We will notify you as soon as it is verified.',
+        );
+      }
+      return [...payments, payment];
+    });
+  } catch (error) {
+    if (receipt) await deleteReceipt(receipt.relativePath).catch(() => undefined);
+    throw error;
+  }
 
   await notify({
     user_id: input.user_id,
@@ -139,83 +158,86 @@ export async function approvePayment(
   admin: { id: string; full_name: string },
   context: { ip?: string | null; note?: string | null } = {},
 ): Promise<{ payment: Payment; activated: boolean }> {
-  return reviewLock.runExclusive(async () => {
-    const payments = await paymentsCollection.read();
-    const payment = payments.find((item) => item.id === id);
-    if (!payment) throw Errors.notFound('That payment no longer exists.');
-    if (payment.status !== 'pending') {
-      throw Errors.conflict(`This payment has already been ${payment.status}.`);
-    }
+  return withStorageTransaction(
+    () => reviewLock.runExclusive(async () => {
+      const payments = await paymentsCollection.read();
+      const payment = payments.find((item) => item.id === id);
+      if (!payment) throw Errors.notFound('That payment no longer exists.');
+      if (payment.status !== 'pending') {
+        throw Errors.conflict(`This payment has already been ${payment.status}.`);
+      }
 
-    const user = await getUserById(payment.user_id);
-    if (!user) throw Errors.notFound('The account for this payment no longer exists.');
+      const user = await getUserById(payment.user_id);
+      if (!user) throw Errors.notFound('The account for this payment no longer exists.');
 
-    const timestamp = nowIso();
-    const updated: Payment = {
-      ...payment,
-      status: 'approved',
-      admin_note: context.note ?? null,
-      reviewed_at: timestamp,
-      reviewed_by: admin.id,
-    };
-    await paymentsCollection.write(
-      payments.map((item) => (item.id === id ? updated : item)),
-    );
+      const timestamp = nowIso();
+      const updated: Payment = {
+        ...payment,
+        status: 'approved',
+        admin_note: context.note ?? null,
+        reviewed_at: timestamp,
+        reviewed_by: admin.id,
+      };
+      await paymentsCollection.mutate((current) =>
+        current.map((item) => (item.id === id ? updated : item)),
+      );
 
-    const previousStatus = user.account_status;
-    await setAccountStatus(user.id, 'active', 'Activated after payment approval');
+      const previousStatus = user.account_status;
+      await setAccountStatus(user.id, 'active', 'Activated after payment approval');
 
-    const systemSettings = await getSystemSettings();
-    const paymentSettings = await getPaymentSettings();
+      const systemSettings = await getSystemSettings();
+      const paymentSettings = await getPaymentSettings();
 
-    if (systemSettings.activation_bonus_gems > 0) {
-      await creditWallet({
+      if (systemSettings.activation_bonus_gems > 0) {
+        await creditWallet({
+          user_id: user.id,
+          currency: 'gems',
+          amount: systemSettings.activation_bonus_gems,
+          type: 'account_activation',
+          reference: updated.id,
+          description: `Activation bonus — ${systemSettings.activation_bonus_gems} gems`,
+          actor_id: admin.id,
+        });
+      }
+      if (systemSettings.activation_bonus_coins > 0) {
+        await creditWallet({
+          user_id: user.id,
+          currency: 'coins',
+          amount: systemSettings.activation_bonus_coins,
+          type: 'account_activation',
+          reference: updated.id,
+          description: `Activation bonus — ${systemSettings.activation_bonus_coins} coins`,
+          actor_id: admin.id,
+        });
+      }
+
+      await notify({
         user_id: user.id,
-        currency: 'gems',
-        amount: systemSettings.activation_bonus_gems,
-        type: 'account_activation',
-        reference: updated.id,
-        description: `Activation bonus — ${systemSettings.activation_bonus_gems} gems`,
-        actor_id: admin.id,
+        kind: 'account_approved',
+        title: 'Account activated',
+        message: `Your activation payment was approved. Your account is now active${
+          systemSettings.activation_bonus_gems > 0
+            ? ` and ${systemSettings.activation_bonus_gems} gems have been added to your wallet.`
+            : '.'
+        }`,
+        link: '/dashboard',
       });
-    }
-    if (systemSettings.activation_bonus_coins > 0) {
-      await creditWallet({
-        user_id: user.id,
-        currency: 'coins',
-        amount: systemSettings.activation_bonus_coins,
-        type: 'account_activation',
-        reference: updated.id,
-        description: `Activation bonus — ${systemSettings.activation_bonus_coins} coins`,
-        actor_id: admin.id,
+
+      await recordAudit({
+        admin_id: admin.id,
+        action: 'admin_approved_payment',
+        target_user: user.id,
+        target_label: `${user.full_name} (${user.email})`,
+        previous_value: `payment:${payment.status} account:${previousStatus}`,
+        new_value: `payment:approved account:active`,
+        reason: context.note ?? null,
+        ip_address: context.ip ?? null,
       });
-    }
 
-    await notify({
-      user_id: user.id,
-      kind: 'account_approved',
-      title: 'Account activated',
-      message: `Your activation payment was approved. Your account is now active${
-        systemSettings.activation_bonus_gems > 0
-          ? ` and ${systemSettings.activation_bonus_gems} gems have been added to your wallet.`
-          : '.'
-      }`,
-      link: '/dashboard',
-    });
-
-    await recordAudit({
-      admin_id: admin.id,
-      action: 'admin_approved_payment',
-      target_user: user.id,
-      target_label: `${user.full_name} (${user.email})`,
-      previous_value: `payment:${payment.status} account:${previousStatus}`,
-      new_value: `payment:approved account:active`,
-      reason: context.note ?? null,
-      ip_address: context.ip ?? null,
-    });
-
-    return { payment: updated, activated: true };
-  });
+      return { payment: updated, activated: true };
+    }),
+    'aviator:payment-review',
+  );
 }
 
 export async function rejectPayment(
@@ -230,50 +252,55 @@ export async function rejectPayment(
     });
   }
 
-  return reviewLock.runExclusive(async () => {
-    const payments = await paymentsCollection.read();
-    const payment = payments.find((item) => item.id === id);
-    if (!payment) throw Errors.notFound('That payment no longer exists.');
-    if (payment.status !== 'pending') {
-      throw Errors.conflict(`This payment has already been ${payment.status}.`);
-    }
+  return withStorageTransaction(
+    () => reviewLock.runExclusive(async () => {
+      const payments = await paymentsCollection.read();
+      const payment = payments.find((item) => item.id === id);
+      if (!payment) throw Errors.notFound('That payment no longer exists.');
+      if (payment.status !== 'pending') {
+        throw Errors.conflict(`This payment has already been ${payment.status}.`);
+      }
 
-    const user = await getUserById(payment.user_id);
-    const timestamp = nowIso();
-    const updated: Payment = {
-      ...payment,
-      status: 'rejected',
-      admin_note: reason,
-      rejection_reason: reason,
-      reviewed_at: timestamp,
-      reviewed_by: admin.id,
-    };
-    await paymentsCollection.write(payments.map((item) => (item.id === id ? updated : item)));
+      const user = await getUserById(payment.user_id);
+      const timestamp = nowIso();
+      const updated: Payment = {
+        ...payment,
+        status: 'rejected',
+        admin_note: reason,
+        rejection_reason: reason,
+        reviewed_at: timestamp,
+        reviewed_by: admin.id,
+      };
+      await paymentsCollection.mutate((current) =>
+        current.map((item) => (item.id === id ? updated : item)),
+      );
 
-    if (user) {
-      const previousStatus = user.account_status;
-      await setAccountStatus(user.id, 'rejected', reason);
-      await notify({
-        user_id: user.id,
-        kind: 'account_rejected',
-        title: 'Activation payment rejected',
-        message: reason,
-        link: '/payments',
-      });
-      await recordAudit({
-        admin_id: admin.id,
-        action: 'admin_rejected_payment',
-        target_user: user.id,
-        target_label: `${user.full_name} (${user.email})`,
-        previous_value: `payment:${payment.status} account:${previousStatus}`,
-        new_value: 'payment:rejected account:rejected',
-        reason,
-        ip_address: context.ip ?? null,
-      });
-    }
+      if (user) {
+        const previousStatus = user.account_status;
+        await setAccountStatus(user.id, 'rejected', reason);
+        await notify({
+          user_id: user.id,
+          kind: 'account_rejected',
+          title: 'Activation payment rejected',
+          message: reason,
+          link: '/payments',
+        });
+        await recordAudit({
+          admin_id: admin.id,
+          action: 'admin_rejected_payment',
+          target_user: user.id,
+          target_label: `${user.full_name} (${user.email})`,
+          previous_value: `payment:${payment.status} account:${previousStatus}`,
+          new_value: 'payment:rejected account:rejected',
+          reason,
+          ip_address: context.ip ?? null,
+        });
+      }
 
-    return updated;
-  });
+      return updated;
+    }),
+    'aviator:payment-review',
+  );
 }
 
 export async function paymentStats(): Promise<{

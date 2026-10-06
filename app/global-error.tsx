@@ -31,6 +31,10 @@ export default function RootError({
             The application could not start this page. Please reload, or contact support if it keeps
             happening.
           </p>
+          <p className="mt-3 text-xs leading-relaxed text-slate-500">
+            If this is on Vercel, check that Neon is connected (<code>DATABASE_URL</code> is
+            available) and <code>STORAGE_MODE=postgres</code>; local file storage is not writable there.
+          </p>
           {error.digest ? (
             <p className="mt-3 text-xs text-slate-600">
               Reference: <span className="font-mono">{error.digest}</span>

@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import { purchasesCollection } from '@/lib/storage/collections';
+import { withStorageTransaction } from '@/lib/storage/database';
 import { createLock } from '@/lib/storage/lock';
-import { storeReceipt, type IncomingFile } from '@/lib/storage/files';
+import { deleteReceipt, storeReceipt, type IncomingFile } from '@/lib/storage/files';
 import { Errors } from '@/lib/http';
 import { getPaymentSettings, getSystemSettings } from '@/lib/settings/settings-service';
 import { getUserById } from '@/lib/users/user-service';
@@ -91,7 +92,12 @@ export async function createPurchase(input: SubmitPurchaseInput): Promise<Purcha
     rejection_reason: null,
   };
 
-  await purchasesCollection.mutate((purchases) => [...purchases, purchase]);
+  try {
+    await purchasesCollection.mutate((purchases) => [...purchases, purchase]);
+  } catch (error) {
+    await deleteReceipt(receipt.relativePath).catch(() => undefined);
+    throw error;
+  }
 
   await notify({
     user_id: input.user_id,
@@ -125,56 +131,61 @@ export async function approvePurchase(
   admin: { id: string; full_name: string },
   context: { ip?: string | null; note?: string | null } = {},
 ): Promise<Purchase> {
-  return reviewLock.runExclusive(async () => {
-    const purchases = await purchasesCollection.read();
-    const purchase = purchases.find((item) => item.id === id);
-    if (!purchase) throw Errors.notFound('That purchase no longer exists.');
-    if (purchase.status !== 'pending') {
-      throw Errors.conflict(`This purchase has already been ${purchase.status}.`);
-    }
+  return withStorageTransaction(
+    () => reviewLock.runExclusive(async () => {
+      const purchases = await purchasesCollection.read();
+      const purchase = purchases.find((item) => item.id === id);
+      if (!purchase) throw Errors.notFound('That purchase no longer exists.');
+      if (purchase.status !== 'pending') {
+        throw Errors.conflict(`This purchase has already been ${purchase.status}.`);
+      }
 
-    const timestamp = nowIso();
-    const updated: Purchase = {
-      ...purchase,
-      status: 'approved',
-      admin_note: context.note ?? null,
-      reviewed_at: timestamp,
-      reviewed_by: admin.id,
-    };
-    await purchasesCollection.write(purchases.map((item) => (item.id === id ? updated : item)));
+      const timestamp = nowIso();
+      const updated: Purchase = {
+        ...purchase,
+        status: 'approved',
+        admin_note: context.note ?? null,
+        reviewed_at: timestamp,
+        reviewed_by: admin.id,
+      };
+      await purchasesCollection.mutate((current) =>
+        current.map((item) => (item.id === id ? updated : item)),
+      );
 
-    // Credits are granted here — the only place a purchase can mint credits.
-    await creditWallet({
-      user_id: purchase.user_id,
-      currency: purchase.currency,
-      amount: purchase.credits,
-      type: purchase.currency === 'gems' ? 'gem_purchase' : 'coin_purchase',
-      reference: purchase.id,
-      description: `${purchase.package_name} — approved by ${admin.full_name}`,
-      actor_id: admin.id,
-    });
+      // Credits are granted here — the only place a purchase can mint credits.
+      await creditWallet({
+        user_id: purchase.user_id,
+        currency: purchase.currency,
+        amount: purchase.credits,
+        type: purchase.currency === 'gems' ? 'gem_purchase' : 'coin_purchase',
+        reference: purchase.id,
+        description: `${purchase.package_name} — approved by ${admin.full_name}`,
+        actor_id: admin.id,
+      });
 
-    await notify({
-      user_id: purchase.user_id,
-      kind: 'purchase_approved',
-      title: 'Credits added',
-      message: `${purchase.credits.toLocaleString()} ${purchase.currency} from your ${purchase.package_name} purchase have been added to your wallet.`,
-      link: '/wallet',
-    });
+      await notify({
+        user_id: purchase.user_id,
+        kind: 'purchase_approved',
+        title: 'Credits added',
+        message: `${purchase.credits.toLocaleString()} ${purchase.currency} from your ${purchase.package_name} purchase have been added to your wallet.`,
+        link: '/wallet',
+      });
 
-    await recordAudit({
-      admin_id: admin.id,
-      action: 'admin_approved_purchase',
-      target_user: purchase.user_id,
-      target_label: `${purchase.package_name} (${purchase.id})`,
-      previous_value: 'purchase:pending',
-      new_value: `purchase:approved +${purchase.credits} ${purchase.currency}`,
-      reason: context.note ?? null,
-      ip_address: context.ip ?? null,
-    });
+      await recordAudit({
+        admin_id: admin.id,
+        action: 'admin_approved_purchase',
+        target_user: purchase.user_id,
+        target_label: `${purchase.package_name} (${purchase.id})`,
+        previous_value: 'purchase:pending',
+        new_value: `purchase:approved +${purchase.credits} ${purchase.currency}`,
+        reason: context.note ?? null,
+        ip_address: context.ip ?? null,
+      });
 
-    return updated;
-  });
+      return updated;
+    }),
+    'aviator:payment-review',
+  );
 }
 
 export async function rejectPurchase(
@@ -189,46 +200,51 @@ export async function rejectPurchase(
     });
   }
 
-  return reviewLock.runExclusive(async () => {
-    const purchases = await purchasesCollection.read();
-    const purchase = purchases.find((item) => item.id === id);
-    if (!purchase) throw Errors.notFound('That purchase no longer exists.');
-    if (purchase.status !== 'pending') {
-      throw Errors.conflict(`This purchase has already been ${purchase.status}.`);
-    }
+  return withStorageTransaction(
+    () => reviewLock.runExclusive(async () => {
+      const purchases = await purchasesCollection.read();
+      const purchase = purchases.find((item) => item.id === id);
+      if (!purchase) throw Errors.notFound('That purchase no longer exists.');
+      if (purchase.status !== 'pending') {
+        throw Errors.conflict(`This purchase has already been ${purchase.status}.`);
+      }
 
-    const updated: Purchase = {
-      ...purchase,
-      status: 'rejected',
-      admin_note: reason,
-      rejection_reason: reason,
-      reviewed_at: nowIso(),
-      reviewed_by: admin.id,
-    };
-    await purchasesCollection.write(purchases.map((item) => (item.id === id ? updated : item)));
+      const updated: Purchase = {
+        ...purchase,
+        status: 'rejected',
+        admin_note: reason,
+        rejection_reason: reason,
+        reviewed_at: nowIso(),
+        reviewed_by: admin.id,
+      };
+      await purchasesCollection.mutate((current) =>
+        current.map((item) => (item.id === id ? updated : item)),
+      );
 
-    // Deliberately no wallet change — a rejected purchase never adds credits.
-    await notify({
-      user_id: purchase.user_id,
-      kind: 'purchase_rejected',
-      title: 'Credit purchase rejected',
-      message: reason,
-      link: '/wallet',
-    });
+      // Deliberately no wallet change — a rejected purchase never adds credits.
+      await notify({
+        user_id: purchase.user_id,
+        kind: 'purchase_rejected',
+        title: 'Credit purchase rejected',
+        message: reason,
+        link: '/wallet',
+      });
 
-    await recordAudit({
-      admin_id: admin.id,
-      action: 'admin_rejected_purchase',
-      target_user: purchase.user_id,
-      target_label: `${purchase.package_name} (${purchase.id})`,
-      previous_value: 'purchase:pending',
-      new_value: 'purchase:rejected',
-      reason,
-      ip_address: context.ip ?? null,
-    });
+      await recordAudit({
+        admin_id: admin.id,
+        action: 'admin_rejected_purchase',
+        target_user: purchase.user_id,
+        target_label: `${purchase.package_name} (${purchase.id})`,
+        previous_value: 'purchase:pending',
+        new_value: 'purchase:rejected',
+        reason,
+        ip_address: context.ip ?? null,
+      });
 
-    return updated;
-  });
+      return updated;
+    }),
+    'aviator:payment-review',
+  );
 }
 
 export async function purchaseStats(): Promise<{

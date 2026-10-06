@@ -1,4 +1,5 @@
 import { transactionsCollection, walletsCollection } from '@/lib/storage/collections';
+import { withStorageTransaction } from '@/lib/storage/database';
 import { createLock } from '@/lib/storage/lock';
 import { Errors } from '@/lib/http';
 import { newId, nowIso } from '@/lib/utils';
@@ -71,67 +72,80 @@ export async function applyWalletChange(input: WalletChangeInput): Promise<Walle
   }
   if (!input.user_id) throw Errors.invalid('A wallet change requires a user.');
 
-  return walletLock.runExclusive(async () => {
-    const wallets = await walletsCollection.read();
-    const timestamp = nowIso();
+  return withStorageTransaction(
+    () =>
+      walletLock.runExclusive(async () => {
+        const timestamp = nowIso();
+        let updatedWallet: Wallet | undefined;
+        let transaction: WalletTransaction | undefined;
+        let balanceBefore: number | undefined;
+        let balanceAfter: number | undefined;
 
-    let wallet = wallets.find((item) => item.user_id === input.user_id);
-    if (!wallet) {
-      wallet = {
-        user_id: input.user_id,
-        gems: 0,
-        coins: 0,
-        created_at: timestamp,
-        updated_at: timestamp,
-      };
-    }
+        await walletsCollection.mutate((wallets) => {
+          const existing = wallets.find((item) => item.user_id === input.user_id);
+          const wallet: Wallet = existing ?? {
+            user_id: input.user_id,
+            gems: 0,
+            coins: 0,
+            created_at: timestamp,
+            updated_at: timestamp,
+          };
 
-    const balanceBefore = wallet[input.currency];
-    const balanceAfter = balanceBefore + amount;
+          balanceBefore = wallet[input.currency];
+          balanceAfter = balanceBefore + amount;
 
-    if (balanceAfter < 0 && !input.allow_overdraft) {
-      throw Errors.invalid(
-        `Insufficient ${input.currency}. Your balance is ${balanceBefore.toLocaleString()} ${input.currency}.`,
-      );
-    }
+          if (balanceAfter < 0 && !input.allow_overdraft) {
+            throw Errors.invalid(
+              `Insufficient ${input.currency}. Your balance is ${balanceBefore.toLocaleString()} ${input.currency}.`,
+            );
+          }
 
-    const updatedWallet: Wallet = {
-      ...wallet,
-      [input.currency]: balanceAfter,
-      updated_at: timestamp,
-    };
+          updatedWallet = {
+            ...wallet,
+            [input.currency]: balanceAfter,
+            updated_at: timestamp,
+          };
 
-    const transaction: WalletTransaction = {
-      id: newId('txn'),
-      user_id: input.user_id,
-      type: input.type,
-      currency: input.currency,
-      amount,
-      balance_before: balanceBefore,
-      balance_after: balanceAfter,
-      reference: input.reference,
-      description: input.description,
-      created_at: timestamp,
-      actor_id: input.actor_id ?? null,
-    };
+          transaction = {
+            id: newId('txn'),
+            user_id: input.user_id,
+            type: input.type,
+            currency: input.currency,
+            amount,
+            balance_before: balanceBefore,
+            balance_after: balanceAfter,
+            reference: input.reference,
+            description: input.description,
+            created_at: timestamp,
+            actor_id: input.actor_id ?? null,
+          };
 
-    await walletsCollection.write(
-      wallets.some((item) => item.user_id === input.user_id)
-        ? wallets.map((item) => (item.user_id === input.user_id ? updatedWallet : item))
-        : [...wallets, updatedWallet],
-    );
+          return existing
+            ? wallets.map((item) => (item.user_id === input.user_id ? updatedWallet! : item))
+            : [...wallets, updatedWallet];
+        });
 
-    const transactions = await transactionsCollection.read();
-    const MAX_TRANSACTIONS = 20000;
-    const nextTransactions = [...transactions, transaction];
-    await transactionsCollection.write(
-      nextTransactions.length > MAX_TRANSACTIONS
-        ? nextTransactions.slice(nextTransactions.length - MAX_TRANSACTIONS)
-        : nextTransactions,
-    );
+        if (
+          !updatedWallet ||
+          !transaction ||
+          balanceBefore === undefined ||
+          balanceAfter === undefined
+        ) {
+          throw Errors.server('The wallet change could not be committed.');
+        }
 
-    return { wallet: updatedWallet, transaction, balance_before: balanceBefore, balance_after: balanceAfter };
-  });
+        await transactionsCollection.mutate((transactions) => {
+          const nextTransactions = [...transactions, transaction!];
+          const MAX_TRANSACTIONS = 20_000;
+          return nextTransactions.length > MAX_TRANSACTIONS
+            ? nextTransactions.slice(nextTransactions.length - MAX_TRANSACTIONS)
+            : nextTransactions;
+        });
+
+        return { wallet: updatedWallet, transaction, balance_before: balanceBefore, balance_after: balanceAfter };
+      }),
+    'aviator:wallet-ledger',
+  );
 }
 
 export async function creditWallet(

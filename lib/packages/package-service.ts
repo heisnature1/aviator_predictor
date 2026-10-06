@@ -119,8 +119,7 @@ export async function deletePackage(id: string): Promise<void> {
 
 /** Restores the catalogue the first time the store is created. */
 export async function ensureDefaultPackages(): Promise<void> {
-  const packages = await packagesCollection.read();
-  if (packages.length === 0) {
-    await packagesCollection.write(DEFAULT_PACKAGES);
-  }
+  await packagesCollection.mutate((current) =>
+    current.length === 0 ? DEFAULT_PACKAGES : current,
+  );
 }
