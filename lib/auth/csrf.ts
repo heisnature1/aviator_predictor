@@ -1,5 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto';
-import { getAuthSecret } from './session';
+import { requireAuthSecret, resolveAuthSecret } from './session';
 import { Errors } from '@/lib/http';
 import { CSRF_COOKIE, CSRF_HEADER } from './constants';
 
@@ -17,9 +17,14 @@ export { CSRF_COOKIE, CSRF_HEADER };
 
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
 
-/** HMAC binding to the app secret so tokens cannot be minted by a client. */
+/**
+ * HMAC binding to the app secret so tokens cannot be minted by a client.
+ * Throws a clean 503 ApiError if the secret is unavailable, so callers that
+ * mint tokens (the CSRF route) degrade to a user-visible service error
+ * rather than an unhandled crash.
+ */
 function sign(value: string): string {
-  return createHmac('sha256', getAuthSecret()).update(value).digest('base64url').slice(0, 22);
+  return createHmac('sha256', requireAuthSecret()).update(value).digest('base64url').slice(0, 22);
 }
 
 export function createCsrfToken(): string {
@@ -29,6 +34,9 @@ export function createCsrfToken(): string {
 
 export function verifyCsrfToken(token: string | null | undefined): boolean {
   if (!token) return false;
+  // Verification fails closed when the secret is unavailable — we cannot
+  // validate a signature we cannot compute. No throw here: this is a read.
+  if (!resolveAuthSecret()) return false;
   const parts = token.split('.');
   if (parts.length !== 3) return false;
   const [random, issuedAt, signature] = parts;
@@ -53,6 +61,10 @@ export function csrfCookieOptions() {
  * Validates the CSRF header against the cookie for mutating requests.
  */
 export function assertCsrf(request: Request): void {
+  // Distinguish server misconfiguration (503, actionable) from a bad or
+  // expired token (403, user should just refresh).
+  requireAuthSecret();
+
   const headerToken = request.headers.get(CSRF_HEADER);
   const cookieHeader = request.headers.get('cookie') ?? '';
   const cookieToken = cookieHeader

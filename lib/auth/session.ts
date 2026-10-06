@@ -21,6 +21,9 @@ export { SESSION_COOKIE };
  */
 
 const DEFAULT_TTL_HOURS = 168; // 7 days
+const DEV_FALLBACK_SECRET = 'dev-only-insecure-secret-please-set-AUTH_SECRET';
+const MIN_SECRET_LENGTH = 16;
+
 let warnedAboutSecret = false;
 
 function sessionTtlMs(): number {
@@ -29,23 +32,68 @@ function sessionTtlMs(): number {
   return safeHours * 60 * 60 * 1000;
 }
 
-export function getAuthSecret(): string {
-  const secret = process.env.AUTH_SECRET;
-  if (secret && secret.length >= 16) return secret;
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error(
-      'AUTH_SECRET is required in production. Generate one with: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"',
-    );
-  }
-  if (!warnedAboutSecret) {
-    warnedAboutSecret = true;
-    console.warn('[auth] AUTH_SECRET is not set — using an insecure development secret.');
-  }
-  return 'dev-only-insecure-secret-please-set-AUTH_SECRET';
+export type AuthSecretStatus =
+  | { configured: true }
+  | { configured: false; reason: 'missing' | 'too_short' | 'placeholder' };
+
+/**
+ * User-facing message for the misconfigured-secret state. Operator-oriented
+ * on purpose — nothing about the deployment leaks into it.
+ */
+export const AUTH_SECRET_UNAVAILABLE_MESSAGE =
+  'This server is missing a required security setting (AUTH_SECRET). Sign-in is disabled until an administrator fixes the configuration.';
+
+/** Inspects the environment without side effects — used for boot diagnostics. */
+export function describeAuthSecret(): AuthSecretStatus {
+  const secret = process.env.AUTH_SECRET?.trim();
+  if (!secret) return { configured: false, reason: 'missing' };
+  if (/replace[-_ ]?me/i.test(secret)) return { configured: false, reason: 'placeholder' };
+  if (secret.length < MIN_SECRET_LENGTH) return { configured: false, reason: 'too_short' };
+  return { configured: true };
 }
 
-function hashToken(token: string): string {
-  return createHash('sha256').update(`${getAuthSecret()}:${token}`).digest('hex');
+/**
+ * Resolves the signing secret, or `null` when a production server is
+ * misconfigured.
+ *
+ * Never throws: per-request code must degrade safely instead of taking every
+ * page down. Verification fails CLOSED — an unverifiable session is simply
+ * treated as signed out. Code that needs to *produce* signed material
+ * (sessions, CSRF tokens) calls `requireAuthSecret()` instead, which fails
+ * with a clean, actionable 503.
+ */
+export function resolveAuthSecret(): string | null {
+  const status = describeAuthSecret();
+  if (status.configured) return process.env.AUTH_SECRET!.trim();
+
+  if (process.env.NODE_ENV !== 'production') {
+    if (!warnedAboutSecret) {
+      warnedAboutSecret = true;
+      console.warn('[auth] AUTH_SECRET is not set — using an insecure development secret.');
+    }
+    return DEV_FALLBACK_SECRET;
+  }
+
+  if (!warnedAboutSecret) {
+    warnedAboutSecret = true;
+    console.error(
+      `[auth] AUTH_SECRET is ${status.reason} — sessions cannot be verified and sign-in is disabled. ` +
+        'Set AUTH_SECRET to a long random string, e.g. ' +
+        "node -e \"console.log(require('crypto').randomBytes(48).toString('hex'))\"",
+    );
+  }
+  return null;
+}
+
+/** Like `resolveAuthSecret`, but throws a clean 503 ApiError when the secret is unavailable. */
+export function requireAuthSecret(): string {
+  const secret = resolveAuthSecret();
+  if (secret) return secret;
+  throw Errors.serviceUnavailable(AUTH_SECRET_UNAVAILABLE_MESSAGE);
+}
+
+function hashToken(secret: string, token: string): string {
+  return createHash('sha256').update(`${secret}:${token}`).digest('hex');
 }
 
 export function cookieOptions(expiresAt: Date) {
@@ -62,6 +110,7 @@ export async function issueSession(
   user: User,
   meta: { ip?: string | null; userAgent?: string | null } = {},
 ): Promise<{ token: string; expiresAt: Date; session: Session }> {
+  const secret = requireAuthSecret();
   const token = randomBytes(32).toString('hex');
   const timestamp = nowIso();
   const expiresAt = new Date(Date.now() + sessionTtlMs());
@@ -69,7 +118,7 @@ export async function issueSession(
   const session: Session = {
     id: newId('ses'),
     user_id: user.id,
-    token_hash: hashToken(token),
+    token_hash: hashToken(secret, token),
     created_at: timestamp,
     expires_at: expiresAt.toISOString(),
     last_seen_at: timestamp,
@@ -125,7 +174,12 @@ export async function getCurrentUser(): Promise<AuthenticatedContext | null> {
   const token = await readCookieToken();
   if (!token) return null;
 
-  const tokenHash = hashToken(token);
+  // A misconfigured production server cannot verify sessions. Fail closed:
+  // the visitor is treated as signed out instead of crashing every page.
+  const secret = resolveAuthSecret();
+  if (!secret) return null;
+
+  const tokenHash = hashToken(secret, token);
   const sessions = await sessionsCollection.read();
   const session = sessions.find((entry) => {
     if (entry.revoked_at) return false;
@@ -170,7 +224,10 @@ export async function requireAdmin(): Promise<AuthenticatedContext> {
 }
 
 export async function revokeSession(token: string): Promise<void> {
-  const tokenHash = hashToken(token);
+  const secret = resolveAuthSecret();
+  // Without a secret there are no verifiable sessions to revoke.
+  if (!secret) return;
+  const tokenHash = hashToken(secret, token);
   const timestamp = nowIso();
   await sessionsCollection.mutate((sessions) =>
     sessions.map((session) =>
