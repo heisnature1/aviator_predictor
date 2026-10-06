@@ -42,6 +42,8 @@ export const Errors = {
     new ApiError(message, { status: 429, code: 'rate_limited' }),
   server: (message = 'Something went wrong on our side. Please try again shortly.') =>
     new ApiError(message, { status: 500, code: 'server_error' }),
+  serviceUnavailable: (message = 'The service is temporarily unavailable. Please try again shortly.') =>
+    new ApiError(message, { status: 503, code: 'service_unavailable' }),
 };
 
 export function ok<T>(data: T, status = 200): NextResponse {

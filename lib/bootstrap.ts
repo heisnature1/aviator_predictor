@@ -1,6 +1,7 @@
 import { ensureStore } from '@/lib/storage/database';
 import { ensureDefaultPackages } from '@/lib/packages/package-service';
 import { createAdminAccount, getUserByEmail } from '@/lib/users/user-service';
+import { describeAuthSecret } from '@/lib/auth/session';
 
 /**
  * Platform bootstrap.
@@ -33,9 +34,36 @@ export async function ensureAdminFromEnv(): Promise<{ created: boolean; email: s
   return { created: true, email };
 }
 
+/**
+ * Loud, unmissable boot diagnostic for the most common production outage:
+ * a missing/placeholder AUTH_SECRET. The app degrades safely (visitors are
+ * treated as signed out, mutations return a clear 503), but the operator
+ * should see exactly what is wrong in the server log immediately.
+ */
+function warnIfAuthSecretMisconfigured(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+  const status = describeAuthSecret();
+  if (status.configured) return;
+  console.error(
+    [
+      '',
+      '=====================================================================',
+      '  AVIATOR INSIGHTS — CONFIGURATION ERROR',
+      `  AUTH_SECRET is ${status.reason}. Until it is set, nobody can sign`,
+      '  in and every account action is rejected with a 503.',
+      '  Generate one with:',
+      "    node -e \"console.log(require('crypto').randomBytes(48).toString('hex'))\"",
+      '  and expose it as the AUTH_SECRET environment variable.',
+      '=====================================================================',
+      '',
+    ].join('\n'),
+  );
+}
+
 export function bootstrapPlatform(): Promise<void> {
   if (!bootstrapped) {
     bootstrapped = (async () => {
+      warnIfAuthSecretMisconfigured();
       await ensureStore();
       await ensureDefaultPackages();
       try {

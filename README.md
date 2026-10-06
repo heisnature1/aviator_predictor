@@ -454,7 +454,7 @@ Mutations require the CSRF header.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `AUTH_SECRET` | – | **Required in production.** Signs session/CSRF material. `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
+| `AUTH_SECRET` | – | **Required in production.** Signs session/CSRF material. Must be ≥ 16 chars and not the `.env.example` placeholder. Generate: `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
 | `SESSION_TTL_HOURS` | `168` | Session lifetime |
 | `LOGIN_RATE_LIMIT` / `REGISTER_RATE_LIMIT` | `8` / `5` | Rate-limit ceilings per 15 min / hour |
 | `STORAGE_MODE` | `local` | Storage driver selector |
@@ -545,6 +545,24 @@ The app is a standard Next.js 15 application and builds cleanly
 4. Keep `AVIATOR_ALLOW_SIMULATION` and `AVIATOR_PREDICTIONS_ALLOW_SIMULATED`
    set to `false`.
 5. Serve over HTTPS (session cookies are marked `Secure` in production).
+
+### Troubleshooting
+
+**Every page shows "Unexpected error", or nobody can sign in (503).**
+This almost always means `AUTH_SECRET` is missing, too short, or still the
+`.env.example` placeholder in a production process. The server logs a
+`CONFIGURATION ERROR` banner on boot when that happens. Until it is fixed the
+app degrades safely — visitors are treated as signed out and account actions
+return a clear `503` instead of crashing — but nobody can authenticate. Set a
+strong `AUTH_SECRET` and restart:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+# export the result as AUTH_SECRET, then restart the server
+```
+
+Note that changing `AUTH_SECRET` invalidates all existing sessions and CSRF
+tokens by design (they are keyed to the secret), so users simply sign in again.
 
 ---
 
