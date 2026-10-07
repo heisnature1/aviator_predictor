@@ -33,8 +33,8 @@ export default function RootError({
           </p>
           <p className="mt-3 text-xs leading-relaxed text-slate-500">
             If this is on Vercel, check that Supabase is configured: <code>DATABASE_URL</code>,
-            <code>SUPABASE_URL</code>, and the server-only <code>SUPABASE_SERVICE_ROLE_KEY</code>
-            must be available, with <code>STORAGE_MODE=postgres</code>. Local file storage is not
+            <code>SUPABASE_URL</code> and a server-only <code>SUPABASE_SECRET_KEY</code> (or legacy
+            <code>SUPABASE_SERVICE_ROLE_KEY</code>) must be available, with <code>STORAGE_MODE=postgres</code>. Local file storage is not
             durable there.
           </p>
           {error.digest ? (

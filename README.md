@@ -463,7 +463,7 @@ Mutations require the CSRF header.
 | `STORAGE_MODE` | `local` (`postgres` on Vercel if omitted) | `local` JSON files or Supabase-backed `postgres` storage |
 | `SUPABASE_DB_URL` / `DATABASE_URL` / `POSTGRES_URL` | – | Supabase Postgres Transaction Pooler URL (port 6543) |
 | `SUPABASE_URL` | – | Supabase project URL used by server-side receipt storage |
-| `SUPABASE_SERVICE_ROLE_KEY` | – | Server-only key for private `uploads` bucket access; never expose to browser code |
+| `SUPABASE_SECRET_KEY` / `SUPABASE_SERVICE_ROLE_KEY` | – | Server-only key for private `uploads` bucket access; use the new secret key when available and never expose it to browser code |
 | `DATA_DIR` / `STORAGE_DIR` | `data` / `storage` | Local-driver storage roots only |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_FULL_NAME` / `ADMIN_USERNAME` | – | Bootstrap administrator (quote values containing `#`) |
 | `AVIATOR_PROVIDER_URL` | – | Authorised live data endpoint |
@@ -601,9 +601,10 @@ Postgres and its private Storage bucket instead of local JSON files:
 2. In Vercel **Project Settings → Environment Variables**, set `DATABASE_URL`
    to that connection string for **Preview** and **Production**. The app also
    accepts `SUPABASE_DB_URL` or `POSTGRES_URL`.
-3. Set `SUPABASE_URL` and the server-only `SUPABASE_SERVICE_ROLE_KEY` for both
-   environments. Never expose the service-role key through a `NEXT_PUBLIC_`
-   variable. Keep `STORAGE_MODE=postgres` (or leave it unset on Vercel).
+3. Set `SUPABASE_URL` and the server-only `SUPABASE_SECRET_KEY` (or the legacy
+   `SUPABASE_SERVICE_ROLE_KEY`) for both environments. Never expose the secret
+   key through a `NEXT_PUBLIC_` variable. Keep `STORAGE_MODE=postgres` (or leave
+   it unset on Vercel).
 4. Set the Vercel Node.js runtime to **22.x** or newer. Set a strong
    `AUTH_SECRET` and unique `ADMIN_EMAIL` / `ADMIN_PASSWORD` values; never use
    the example credentials.
@@ -645,7 +646,8 @@ That is the root error boundary; its `Reference` number is a Next.js digest,
 not the original exception. Check the runtime/function logs for the request.
 On Vercel, confirm a Supabase Transaction Pooler URL is available as
 `DATABASE_URL` (or `SUPABASE_DB_URL` / `POSTGRES_URL`), and that
-`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `STORAGE_MODE=postgres` are set.
+`SUPABASE_URL`, `SUPABASE_SECRET_KEY` (or legacy `SUPABASE_SERVICE_ROLE_KEY`),
+and `STORAGE_MODE=postgres` are set.
 The Node.js runtime must be 22.x or newer. The local JSON driver writes under
 `process.cwd()` and is not supported on Vercel; do not point it at `/tmp` for
 account, payment, receipt or wallet data.
