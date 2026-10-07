@@ -9,8 +9,11 @@ import path from 'node:path';
  * `StorageDriver`. `local` (JSON files in ./data) ships with the product and is
  * correct for development and single-node self hosting.
  *
- * A persistent driver (object storage / managed key-value / hosted database)
- * can be registered with `registerDriver()` without touching business logic.
+ * `local` (JSON files) is intended for development or one server with a
+ * persistent disk. `postgres` stores documents in Supabase Postgres and
+ * receipts in its private Storage bucket for Vercel/serverless deployments.
+ * Additional drivers can be registered with `registerDriver()` without
+ * changing business logic.
  *
  * IMPORTANT: a serverless platform does NOT give you a permanent writable disk.
  * If `STORAGE_MODE` is set to anything that has no registered driver, the app
@@ -43,6 +46,13 @@ export interface StorageDriver {
   write(relativePath: string, contents: string): Promise<void>;
   remove(relativePath: string): Promise<void>;
   list(relativeDir: string): Promise<string[]>;
+  /** Optional atomic read/modify/write used by remote document stores. */
+  update?(
+    relativePath: string,
+    updater: (current: string | null) => Promise<string> | string,
+  ): Promise<string>;
+  /** Optional multi-document transaction, with an optional distributed lock key. */
+  transaction?<T>(task: () => Promise<T>, lockKey?: string): Promise<T>;
   /** Optional: create a directory (used for receipt storage). */
   ensureDir(relativeDir: string): Promise<void>;
 }
@@ -171,8 +181,8 @@ export function resolveDriver(mode: string | undefined): StorageDriver {
   if (!driver) {
     throw new StorageConfigurationError(
       `STORAGE_MODE="${resolvedMode}" has no registered storage driver. ` +
-        `Set STORAGE_MODE=local for the built-in JSON file backend, or register a ` +
-        `persistent driver in lib/storage/drivers.ts before deploying. ` +
+        `Set STORAGE_MODE=local for the built-in JSON backend, or set ` +
+        `STORAGE_MODE=postgres and a Supabase Postgres connection URL. ` +
         `The application refuses to start rather than silently lose accounts, ` +
         `payments and wallet balances.`,
     );

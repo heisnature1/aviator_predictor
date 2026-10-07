@@ -46,3 +46,7 @@ next-env.d.ts
 /data/
 /storage/
 /.data-cache
+
+# Supabase CLI state
+/supabase/.branches/
+/supabase/.temp/

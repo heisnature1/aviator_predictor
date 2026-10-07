@@ -2,8 +2,8 @@
 
 A production-structured Aviator insights platform: real user accounts, secure
 cookie sessions, wallet & credits, receipt-based payment verification, a
-statistical prediction service and a full administrator dashboard — built on a
-file-based backend with **no external database**.
+statistical prediction service and a full administrator dashboard. It uses
+local JSON files for self-hosting and Supabase Postgres + private Storage on Vercel.
 
 > **Integrity first.** This project never fabricates official Aviator results,
 > never presents simulated numbers as real game data, and never claims that a
@@ -47,8 +47,9 @@ npm run seed:demo               # optional: demo users, payments & history
 npm run dev                     # http://localhost:3000
 ```
 
-`data/` and `storage/` are created automatically on first boot if they are
-missing — no manual setup, no database, no Supabase.
+In the default local mode, `data/` and `storage/` are created automatically
+on first boot if missing. On Vercel, connect Supabase and select the `postgres`
+storage mode instead of relying on local files.
 
 Other commands:
 
@@ -130,13 +131,15 @@ overview and an immutable activity log.
 | Language   | TypeScript (strict)                                     |
 | Styling    | Tailwind CSS 3.4 (dark glass/gaming aesthetic)           |
 | Backend    | Node.js route handlers + server components               |
-| Storage    | JSON files in `data/`, receipts in `storage/receipts/`   |
+| Storage    | Local JSON files, or Supabase Postgres documents + private Storage receipts on Vercel |
 | Auth       | HTTP-only cookies + scrypt password hashing + CSRF       |
 | Validation | Zod on every API boundary                                |
 
-**Not used:** Supabase, Firebase, PostgreSQL, MongoDB, Prisma or any external
-database / storage-as-a-service. There is no Supabase client, schema, migration
-or environment variable anywhere in the repository.
+The default `local` mode has no external database dependency. The optional
+`postgres` mode uses Supabase Postgres for Vercel/serverless deployments and
+Supabase Storage for private payment receipts. The app does not use Firebase,
+MongoDB or Prisma. Its current sign-in/session logic remains app-managed; it is
+not yet migrated to Supabase Auth.
 
 ---
 
@@ -183,6 +186,7 @@ lib/
 data/…            JSON collections (see below)
 storage/receipts/ uploaded payment receipts (never publicly served)
 scripts/          seed-data · seed-demo · reset-data
+supabase/         private uploads bucket migration · api Edge Function
 types/            shared domain types
 ```
 
@@ -205,6 +209,11 @@ data/
 storage/receipts/<user-id>/<id>.<ext>
 ```
 
+The tree above shows the local driver. With `STORAGE_MODE=postgres`, collection
+JSON is stored in `aviator_storage_documents`, while receipt bytes are kept in
+the private Supabase `uploads` bucket; the database stores only each receipt's
+private object path.
+
 ### Storage abstraction
 
 Nothing outside `lib/storage` touches the filesystem. Business logic uses typed
@@ -215,54 +224,48 @@ await usersCollection.mutate((users) => [...users, newUser]);
 ```
 
 `lib/storage/drivers.ts` defines the `StorageDriver` interface (read / write /
-remove / list / ensureDir). The bundled `local` driver stores JSON in `data/`.
-A persistent driver (object storage, KV, hosted database) can be registered
-without touching business logic:
-
-```ts
-registerDriver(myPersistentDriver); // then set STORAGE_MODE=<its mode>
-```
+remove / list / ensureDir, with optional atomic update/transaction support). The
+bundled `local` driver stores JSON in `data/`.
+The bundled `postgres` driver stores collection documents in Supabase Postgres
+and receipts in a private Supabase Storage bucket, so it works across Vercel
+serverless instances.
+Additional drivers can still be registered without changing business logic.
 
 ### Write safety
 
-Every write follows the same protocol:
-
-1. read the current file
-2. validate it against a Zod schema
-3. write the payload to a unique temp file in the same directory
-4. `fsync` the temp file
-5. atomically `rename()` it over the target
-
-Consequences: a crash or an interrupted write can never leave a half-written
-JSON file; readers always see the previous or the new complete document.
+The local driver writes a temporary file, `fsync`s it, then atomically renames
+it over the target. The Postgres driver validates collection JSON and performs
+writes in Supabase Postgres with per-document advisory locks; it never writes
+into Vercel's read-only deployment directory.
 
 Additional protections:
 
-- **Per-collection serialisation** — concurrent read-modify-write cycles are
-  queued, so two requests cannot lose each other's changes.
-- **Ledger atomicity** — wallet balance + transaction row are written inside one
-  exclusive lock (`lib/storage/lock.ts`).
-- **Corruption recovery** — an unparseable/invalid file is quarantined to
-  `data/_corrupt/<name>-<timestamp>.json` and rebuilt from its seed value
-  instead of crashing the app.
-- **Path traversal guard** — the local driver refuses any path outside the data
-  directory.
+- **Per-collection serialisation** — concurrent read-modify-write cycles use a
+  process lock locally and a Postgres advisory transaction lock on Vercel.
+- **Ledger atomicity** — wallet balance + transaction row are written in one
+  storage transaction on Postgres (and one exclusive lock on a single local
+  process).
+- **Corruption recovery** — invalid JSON is logged and reset to the collection
+  seed; local files are quarantined under `data/_corrupt/`.
+- **Path traversal guard** — local paths are confined to their data directory;
+  remote document keys reject absolute paths and `..` segments.
 
 ### `STORAGE_MODE` and deployments
 
-`STORAGE_MODE=local` uses the JSON backend. **Local disks on serverless
-platforms are not durable** — the app does not pretend otherwise:
+- `STORAGE_MODE=local` uses JSON files and is intended for development or one
+  self-hosted Node.js instance with a persistent mounted disk.
+- `STORAGE_MODE=postgres` uses Supabase Postgres for serverless and
+  multi-instance deployments. Set `DATABASE_URL` to Supabase's Transaction
+  Pooler connection string (port 6543) or use `SUPABASE_DB_URL` / `POSTGRES_URL`.
+  Vercel defaults to `postgres` when `STORAGE_MODE` is omitted; setting `local`
+  on Vercel production fails fast with a configuration error.
+- An unregistered mode fails with `StorageConfigurationError` rather than
+  silently accepting writes that would be lost.
 
-- `/admin` and `/admin/settings` show a durability warning when running in
-  production with a non-persistent driver.
-- If `STORAGE_MODE` names a mode with **no registered driver**, boot fails with
-  an explicit `StorageConfigurationError` instead of silently accepting writes
-  that would be lost.
-
-To go live with real money, register a persistent driver in
-`lib/storage/drivers.ts` (or swap the local driver for one backed by object
-storage / a hosted database) and set `STORAGE_MODE` accordingly. No business
-logic changes are required.
+On Vercel, the Postgres driver stores collection JSON in Supabase Postgres and
+receipt files in the private `uploads` bucket. Receipt bytes are never served
+from a public storage URL; downloads pass through the owner/admin authorization
+route.
 
 ---
 
@@ -457,8 +460,11 @@ Mutations require the CSRF header.
 | `AUTH_SECRET` | – | **Required in production.** Signs session/CSRF material. Must be ≥ 16 chars and not the `.env.example` placeholder. Generate: `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
 | `SESSION_TTL_HOURS` | `168` | Session lifetime |
 | `LOGIN_RATE_LIMIT` / `REGISTER_RATE_LIMIT` | `8` / `5` | Rate-limit ceilings per 15 min / hour |
-| `STORAGE_MODE` | `local` | Storage driver selector |
-| `DATA_DIR` / `STORAGE_DIR` | `data` / `storage` | Storage roots |
+| `STORAGE_MODE` | `local` (`postgres` on Vercel if omitted) | `local` JSON files or Supabase-backed `postgres` storage |
+| `SUPABASE_DB_URL` / `DATABASE_URL` / `POSTGRES_URL` | – | Supabase Postgres Transaction Pooler URL (port 6543) |
+| `SUPABASE_URL` | – | Supabase project URL used by server-side receipt storage |
+| `SUPABASE_SECRET_KEY` / `SUPABASE_SERVICE_ROLE_KEY` | – | Server-only key for private `uploads` bucket access; use the new secret key when available and never expose it to browser code |
+| `DATA_DIR` / `STORAGE_DIR` | `data` / `storage` | Local-driver storage roots only |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_FULL_NAME` / `ADMIN_USERNAME` | – | Bootstrap administrator (quote values containing `#`) |
 | `AVIATOR_PROVIDER_URL` | – | Authorised live data endpoint |
 | `AVIATOR_PROVIDER_KEY` | – | Bearer token for the provider |
@@ -585,18 +591,50 @@ Put the service behind an HTTPS reverse proxy. Keep exactly one application
 instance when using the local driver; it coordinates writes only inside that
 process. The data and receipt folders must be backed up as sensitive data.
 
-Vercel and other serverless hosts do **not** provide this persistent writable
-filesystem. A Vercel deployment needs a persistent storage driver integrated
-with the app; pointing `DATA_DIR` or `STORAGE_DIR` at `/tmp` is not a safe
-solution for accounts, payments, receipts or wallet balances.
+### Vercel deployment with Supabase
+
+Vercel does not provide a persistent writable app directory, so use Supabase
+Postgres and its private Storage bucket instead of local JSON files:
+
+1. Create or select a Supabase project. In its **Connect** panel, copy the
+   **Transaction Pooler** connection string (port `6543`) for serverless use.
+2. In Vercel **Project Settings → Environment Variables**, set `DATABASE_URL`
+   to that connection string for **Preview** and **Production**. The app also
+   accepts `SUPABASE_DB_URL` or `POSTGRES_URL`.
+3. Set `SUPABASE_URL` and the server-only `SUPABASE_SECRET_KEY` (or the legacy
+   `SUPABASE_SERVICE_ROLE_KEY`) for both environments. Never expose the secret
+   key through a `NEXT_PUBLIC_` variable. Keep `STORAGE_MODE=postgres` (or leave
+   it unset on Vercel).
+4. Set the Vercel Node.js runtime to **22.x** or newer. Set a strong
+   `AUTH_SECRET` and unique `ADMIN_EMAIL` / `ADMIN_PASSWORD` values; never use
+   the example credentials.
+5. Apply the Supabase migration and deploy the Edge Function:
+
+   ```bash
+   npx supabase login
+   npx supabase link --project-ref <your-supabase-project-ref>
+   npx supabase db push
+   npx supabase functions deploy api
+   ```
+
+   The migration creates the private `uploads` bucket and the protected
+   `aviator_storage_documents` table. On first app startup, missing collection
+   documents and defaults are seeded. The `api` Edge Function is public and
+   returns a plain-text greeting; it does not access user data.
+6. Redeploy the Vercel Preview and Production deployments after saving their
+   environment variables.
+
+For local testing, put the same server-only variables in the ignored
+`.env.local` and set `STORAGE_MODE=postgres`. Back up the Supabase database and
+Storage bucket: they contain account, session, payment, wallet, audit and
+private receipt data. Existing JSON data is not migrated automatically.
 
 Before handling real money:
 
-1. Set a strong `AUTH_SECRET` and configure the `ADMIN_*` variables.
+1. Set a strong `AUTH_SECRET` and configure unique `ADMIN_*` credentials.
 2. Point `AVIATOR_PROVIDER_URL` at a data source you are licensed to use.
-3. Ensure storage is durable: use a registered persistent driver on serverless
-   or multi-instance hosts, or use the local driver with persistent mounted
-   disks on a single-node host.
+3. Use Supabase/Postgres on Vercel or persistent mounted disks on one self-hosted
+   Node.js instance. Never point local JSON storage at `/tmp`.
 4. Keep `AVIATOR_ALLOW_SIMULATION` and `AVIATOR_PREDICTIONS_ALLOW_SIMULATED`
    set to `false`.
 5. Serve over HTTPS (session cookies are marked `Secure` in production).
@@ -605,14 +643,14 @@ Before handling real money:
 
 **The page shows "Unexpected error" after a successful build.**
 That is the root error boundary; its `Reference` number is a Next.js digest,
-not the original exception. Check the runtime/function logs for the request. A
-common cause on Vercel is `STORAGE_MODE=local` (the default): startup creates
-and writes JSON files beneath `process.cwd()`, but a serverless deployment does
-not provide a persistent writable app directory. This repository currently
-ships only the local driver, so setting `STORAGE_MODE` to an unregistered name
-will also fail at runtime. Use the Docker + persistent-disk setup above, or
-integrate and configure a real persistent driver before using Vercel. Do not
-use `/tmp` for account, payment, receipt or wallet data.
+not the original exception. Check the runtime/function logs for the request.
+On Vercel, confirm a Supabase Transaction Pooler URL is available as
+`DATABASE_URL` (or `SUPABASE_DB_URL` / `POSTGRES_URL`), and that
+`SUPABASE_URL`, `SUPABASE_SECRET_KEY` (or legacy `SUPABASE_SERVICE_ROLE_KEY`),
+and `STORAGE_MODE=postgres` are set.
+The Node.js runtime must be 22.x or newer. The local JSON driver writes under
+`process.cwd()` and is not supported on Vercel; do not point it at `/tmp` for
+account, payment, receipt or wallet data.
 
 A missing or placeholder `AUTH_SECRET` is a separate issue: the server logs a
 `CONFIGURATION ERROR`, treats visitors as signed out and returns `503` for

@@ -1,14 +1,16 @@
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { RECEIPTS_ROOT } from './database';
+import { getDriver, RECEIPTS_ROOT } from './database';
+import { StorageWriteError } from './drivers';
+import { getSupabaseClient, SUPABASE_UPLOADS_BUCKET } from './supabase-client';
 
 /**
  * Receipt file storage.
  * ---------------------------------------------------------------------------
- * Uploaded receipts are written to `storage/receipts/<user-id>/<id>.<ext>`.
- * The directory is NEVER publicly exposed: files are only ever served through
- * /api/receipts/[id], which authorises the request first (owner or admin).
+ * Local receipts are written to `storage/receipts/<user-id>/<id>.<ext>`;
+ * remote receipts live in the private Supabase `uploads` bucket. Files are only
+ * served through /api/receipts/[id], which authorises the request first.
  */
 
 export const RECEIPT_MIME_TYPES = {
@@ -59,6 +61,28 @@ const SIGNATURES: MagicSignature[] = [
   },
   { mime: 'application/pdf', test: (b) => b.toString('ascii', 0, 4) === '%PDF' },
 ];
+
+function isMissingStorageObject(error: { status?: number; statusCode?: string; message: string }) {
+  return (
+    error.status === 404 ||
+    error.statusCode === '404' ||
+    error.statusCode === 'NoSuchKey' ||
+    /object.*not found|not found.*object/i.test(error.message)
+  );
+}
+
+async function readSupabaseReceipt(key: string): Promise<Buffer | null> {
+  const { data, error } = await getSupabaseClient()
+    .storage.from(SUPABASE_UPLOADS_BUCKET)
+    .download(key);
+  if (error) {
+    if (isMissingStorageObject(error)) return null;
+    console.error('[storage] Supabase receipt download failed', error);
+    throw new StorageWriteError('Unable to read the receipt from private storage.');
+  }
+  if (!data) return null;
+  return Buffer.from(await data.arrayBuffer());
+}
 
 export interface StoredReceipt {
   /** Path relative to the storage root, e.g. `receipts/<user>/<id>.png`. */
@@ -132,10 +156,29 @@ export async function storeReceipt(
 
   const extension = RECEIPT_MIME_TYPES[detected.mime];
   const id = `${Date.now().toString(36)}-${randomBytes(6).toString('hex')}`;
+  const fileName = `${id}.${extension}`;
+  const relativePath = `receipts/${safeUserDir}/${fileName}`;
+  const driver = getDriver();
+
+  if (driver.mode !== 'local') {
+    const { error } = await getSupabaseClient()
+      .storage.from(SUPABASE_UPLOADS_BUCKET)
+      .upload(relativePath, new Uint8Array(buffer), {
+        cacheControl: '0',
+        contentType: detected.mime,
+        upsert: false,
+      });
+    if (error) {
+      console.error('[storage] Supabase receipt upload failed', error);
+      throw new StorageWriteError('Unable to store the receipt in private storage.');
+    }
+    return { relativePath, fileName, mime: detected.mime, size: buffer.byteLength };
+  }
+
   const targetDir = path.join(RECEIPTS_ROOT, safeUserDir);
   await fs.mkdir(targetDir, { recursive: true });
 
-  const absolute = path.join(targetDir, `${id}.${extension}`);
+  const absolute = path.join(targetDir, fileName);
   const tmp = path.join(targetDir, `.${id}.${extension}.${randomBytes(4).toString('hex')}.tmp`);
   const handle = await fs.open(tmp, 'w');
   try {
@@ -148,7 +191,7 @@ export async function storeReceipt(
 
   return {
     relativePath: path.relative(path.dirname(RECEIPTS_ROOT), absolute).split(path.sep).join('/'),
-    fileName: `${id}.${extension}`,
+    fileName,
     mime: detected.mime,
     size: buffer.byteLength,
   };
@@ -162,16 +205,25 @@ export interface ReadReceiptResult {
 
 /** Reads a receipt by its stored relative path (e.g. `receipts/<user>/<file>`). */
 export async function readReceipt(relativePath: string): Promise<ReadReceiptResult | null> {
-  if (!relativePath || relativePath.includes('..')) return null;
-  const absolute = path.join(path.dirname(RECEIPTS_ROOT), relativePath);
-  const root = path.dirname(RECEIPTS_ROOT) + path.sep;
-  if (!absolute.startsWith(root)) return null;
+  const key = relativePath.replace(/\\/g, '/');
+  const segments = key.split('/');
+  if (
+    !key.startsWith('receipts/') ||
+    segments.some((segment) => !segment || segment === '.' || segment === '..')
+  ) {
+    return null;
+  }
 
-  const extension = path.extname(absolute).slice(1).toLowerCase();
+  const extension = path.posix.extname(key).slice(1).toLowerCase();
   if (!RECEIPT_EXTENSIONS.includes(extension as (typeof RECEIPT_EXTENSIONS)[number])) return null;
 
+  const driver = getDriver();
   try {
-    const buffer = await fs.readFile(absolute);
+    const buffer =
+      driver.mode === 'local'
+        ? await fs.readFile(path.join(path.dirname(RECEIPTS_ROOT), ...segments))
+        : await readSupabaseReceipt(key);
+    if (!buffer || buffer.byteLength === 0) return null;
     const mime =
       extension === 'pdf'
         ? 'application/pdf'
@@ -180,7 +232,7 @@ export async function readReceipt(relativePath: string): Promise<ReadReceiptResu
           : extension === 'webp'
             ? 'image/webp'
             : 'image/jpeg';
-    return { buffer, mime, fileName: path.basename(absolute) };
+    return { buffer, mime, fileName: path.posix.basename(key) };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
@@ -188,12 +240,29 @@ export async function readReceipt(relativePath: string): Promise<ReadReceiptResu
 }
 
 export async function deleteReceipt(relativePath: string): Promise<void> {
-  if (!relativePath || relativePath.includes('..')) return;
-  const absolute = path.join(path.dirname(RECEIPTS_ROOT), relativePath);
-  const root = path.dirname(RECEIPTS_ROOT) + path.sep;
-  if (!absolute.startsWith(root)) return;
+  const key = relativePath.replace(/\\/g, '/');
+  const segments = key.split('/');
+  if (
+    !key.startsWith('receipts/') ||
+    segments.some((segment) => !segment || segment === '.' || segment === '..')
+  ) {
+    return;
+  }
+
+  const driver = getDriver();
+  if (driver.mode !== 'local') {
+    const { error } = await getSupabaseClient()
+      .storage.from(SUPABASE_UPLOADS_BUCKET)
+      .remove([key]);
+    if (error && !isMissingStorageObject(error)) {
+      console.error('[storage] Supabase receipt deletion failed', error);
+      throw new StorageWriteError('Unable to delete the receipt from private storage.');
+    }
+    return;
+  }
+
   try {
-    await fs.unlink(absolute);
+    await fs.unlink(path.join(path.dirname(RECEIPTS_ROOT), ...segments));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
